@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/certusone/wormhole/node/pkg/common"
@@ -124,6 +125,19 @@ func (e *Watcher) Run(ctx context.Context) error {
 			// If either of the below cases are true, something has gone wrong
 			if r.ChainId > math.MaxUint16 || vaa.ChainID(r.ChainId) != e.chainID {
 				panic("invalid chain ID")
+			}
+
+			// Aptos's TxID is a uint64. Historically, all TxIDs used a fixed 32-byte hash type.
+			// This parsing is leftover from that time period. It should be possible to refactor
+			// this code such that the TxID received from p2p is exactly 8 bytes, which would
+			// obviate the need for the below bounds check and parsing.
+			//
+			// SECURITY: This acts as a bounds check for the BigEndian.Unint64 call below.
+			const AptosTxIDExpectedLen = 32
+			if len(r.TxHash) < AptosTxIDExpectedLen {
+				logger.Error("invalid TxID: too short")
+				p2p.DefaultRegistry.AddErrorCount(e.chainID, 1)
+				continue
 			}
 
 			// uint64 will read the *first* 8 bytes, but the sequence is stored in the *last* 8.
@@ -295,6 +309,7 @@ func (e *Watcher) observeData(logger *zap.Logger, data gjson.Result, nativeSeq u
 	emitter := make([]byte, 8)
 	binary.BigEndian.PutUint64(emitter, em.Uint())
 
+	// SECURITY: vaa.Address is guaranteed to be 32 bytes so copy's slice into `a` is safe.
 	var a vaa.Address
 	copy(a[24:], emitter)
 
@@ -309,9 +324,15 @@ func (e *Watcher) observeData(logger *zap.Logger, data gjson.Result, nativeSeq u
 		return
 	}
 
-	pl, err := hex.DecodeString(v.String()[2:])
+	s := v.String()
+	if !strings.HasPrefix(s, "0x") {
+		logger.Error("payload missing 0x prefix", zap.String("payload", s))
+		return
+	}
+
+	pl, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
 	if err != nil {
-		logger.Error("payload decode")
+		logger.Error("payload decode", zap.Error(err))
 		return
 	}
 

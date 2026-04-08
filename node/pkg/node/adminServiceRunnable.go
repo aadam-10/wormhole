@@ -12,6 +12,7 @@ import (
 	guardianDB "github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/governor"
 	"github.com/certusone/wormhole/node/pkg/guardiansigner"
+	"github.com/certusone/wormhole/node/pkg/manager"
 	"github.com/certusone/wormhole/node/pkg/notary"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	nodev1 "github.com/certusone/wormhole/node/pkg/proto/node/v1"
@@ -41,6 +42,7 @@ func adminServiceRunnable(
 	ethContract *string,
 	rpcMap map[string]string,
 	reobservers interfaces.Reobservers,
+	managerSvc *manager.ManagerService,
 ) (supervisor.Runnable, error) {
 	// Delete existing UNIX socket, if present.
 	fi, err := os.Stat(socketPath)
@@ -79,7 +81,7 @@ func adminServiceRunnable(
 	var evmConnector connectors.Connector
 	if ethRpc != nil && ethContract != nil {
 		contract := ethcommon.HexToAddress(*ethContract)
-		evmConnector, err = connectors.NewEthereumBaseConnector(ctx, "eth", *ethRpc, contract, logger)
+		evmConnector, err = connectors.NewEthereumBaseConnector(ctx, "eth", *ethRpc, contract, nil, logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to ethereum")
 		}
@@ -100,7 +102,7 @@ func adminServiceRunnable(
 		reobservers,
 	)
 
-	publicrpcService := publicrpc.NewPublicrpcServer(logger, db, gst, gov)
+	publicrpcService := publicrpc.NewPublicrpcServer(logger, db, gst, gov, managerSvc)
 
 	grpcServer := common.NewInstrumentedGRPCServer(logger, common.GrpcLogDetailMinimal)
 	nodev1.RegisterNodePrivilegedServiceServer(grpcServer, nodeService)

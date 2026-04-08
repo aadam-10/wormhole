@@ -612,12 +612,13 @@ func (s *SolanaWatcher) fetchBlock(ctx context.Context, logger *zap.Logger, slot
 	s.updateLatestBlock(slot)
 
 	for txNum, txRpc := range out.Transactions {
-		if txRpc.Meta.Err != nil {
+		// SECURITY: Validate transaction metadata before accessing fields
+		if metaErr := validateTransactionMeta(txRpc.Meta); metaErr != nil {
 			if logger.Level().Enabled(zapcore.DebugLevel) {
-				logger.Debug("Transaction failed, skipping it",
+				logger.Debug("skipping transaction",
 					zap.Uint64("slot", slot),
 					zap.Int("txNum", txNum),
-					zap.String("err", fmt.Sprint(txRpc.Meta.Err)),
+					zap.String("reason", metaErr.Error()),
 				)
 			}
 			continue
@@ -655,6 +656,17 @@ func (s *SolanaWatcher) fetchBlock(ctx context.Context, logger *zap.Logger, slot
 
 // processTransaction processes a transaction and publishes any Wormhole events.
 func (s *SolanaWatcher) processTransaction(ctx context.Context, rpcClient *rpc.Client, tx *solana.Transaction, meta *rpc.TransactionMeta, slot uint64, isReobservation bool) (numObservations uint32) {
+	// SECURITY: Validate transaction metadata before accessing fields
+	if metadataErr := validateTransactionMeta(meta); metadataErr != nil {
+		if s.logger.Level().Enabled(zapcore.DebugLevel) {
+			s.logger.Debug("skipping transaction",
+				zap.Uint64("slot", slot),
+				zap.String("reason", metadataErr.Error()),
+			)
+		}
+		return
+	}
+
 	signature := tx.Signatures[0]
 	err := s.populateLookupTableAccounts(ctx, rpcClient, tx)
 	if err != nil {
@@ -669,6 +681,10 @@ func (s *SolanaWatcher) processTransaction(ctx context.Context, rpcClient *rpc.C
 	var programIndex uint16
 	var shimProgramIndex uint16
 	var shimFound bool
+
+	// SECURITY: Mapping of AccountKeys matches the indexes associated with the original transaction.
+	// This is filled via a helper function. The ordering is AccountKeys (static accounts), Writable Account Lookup Table (ALT) entries, and Readable ALT entries.
+	//
 	for n, key := range tx.Message.AccountKeys {
 		if key.Equals(s.contract) {
 			programIndex = uint16(n) // #nosec G115 -- The solana runtime can only support 64 accounts per transaction max
@@ -894,6 +910,14 @@ func (s *SolanaWatcher) fetchMessageAccount(ctx context.Context, rpcClient *rpc.
 		return 0, true
 	}
 
+	if info.Value == nil {
+		s.logger.Warn("account does not exist",
+			zap.Uint64("slot", slot),
+			zap.Stringer("account", acc))
+		return 0, true
+	}
+
+	// SECURITY: Wormhole must own the account. Otherwise, this would lead to an arbitrary event emission issue.
 	if !info.Value.Owner.Equals(s.contract) {
 		p2p.DefaultRegistry.AddErrorCount(s.chainID, 1)
 		solanaConnectionErrors.WithLabelValues(s.networkName, string(s.commitment), "account_owner_mismatch").Inc()
@@ -904,6 +928,7 @@ func (s *SolanaWatcher) fetchMessageAccount(ctx context.Context, rpcClient *rpc.
 		return 0, false
 	}
 
+	// SECURITY: Account discriminator must match one of two types. Otherwise, leads to type cosplay.
 	data := info.Value.Data.GetBinary()
 	if string(data[:3]) != accountPrefixReliable && string(data[:3]) != accountPrefixUnreliable {
 		p2p.DefaultRegistry.AddErrorCount(s.chainID, 1)
@@ -952,6 +977,7 @@ func (s *SolanaWatcher) processAccountSubscriptionData(_ context.Context, logger
 
 	value := (*res.Params).Result.Value
 
+	// SECURITY: Account ownership must be the SVM core bridge.
 	if value.Account.Owner != s.rawContract {
 		// We got a message for the wrong contract on the websocket... uncomfortable...
 		solanaConnectionErrors.WithLabelValues(s.networkName, string(s.commitment), "invalid_websocket_account").Inc()
@@ -982,6 +1008,7 @@ func (s *SolanaWatcher) processAccountSubscriptionData(_ context.Context, logger
 	return nil
 }
 
+// SECURITY: Ownership check on account key must be done BEFORE this function is called.
 func (s *SolanaWatcher) processMessageAccount(logger *zap.Logger, data []byte, acc solana.PublicKey, isReobservation bool, signature solana.Signature) (numObservations uint32) {
 	proposal, err := ParseMessagePublicationAccount(data)
 	if err != nil {
@@ -1046,7 +1073,7 @@ func (s *SolanaWatcher) processMessageAccount(logger *zap.Logger, data []byte, a
 		Timestamp:        time.Unix(int64(proposal.SubmissionTime), 0),
 		Nonce:            proposal.Nonce,
 		Sequence:         proposal.Sequence,
-		EmitterChain:     s.chainID,
+		EmitterChain:     s.chainID, // SECURITY: The message must be emitted from the chain this watcher is observing. This prevents mix-ups between different SVM chains.
 		EmitterAddress:   proposal.EmitterAddress,
 		Payload:          proposal.Payload,
 		ConsistencyLevel: proposal.ConsistencyLevel,
@@ -1206,4 +1233,23 @@ func isPossibleWormholeMessage(whLogPrefix string, logMessages []string) bool {
 		}
 	}
 	return false
+}
+
+// validateTransactionMeta checks if transaction metadata is present and the transaction succeeded.
+// Returns specific errors for nil metadata or transactions that failed on-chain.
+// This function does not validate the transaction itself or check if it's relevant to the watcher.
+//
+// SECURITY: This function should be used to validate every transaction to ensure that they did not fail on-chain.
+func validateTransactionMeta(meta *rpc.TransactionMeta) error {
+	// See: [https://solana.com/docs/rpc/http/gettransaction]. The metadata field may be `null` so solana-go
+	// may correctly give a nil result in this case. This is not expected to occur in practice.
+	// However, we must avoid processing nil metadata or failed transactions.
+	if meta == nil {
+		return fmt.Errorf("transaction metadata is nil")
+	}
+
+	if meta.Err != nil {
+		return fmt.Errorf("transaction failed on-chain: %v", meta.Err)
+	}
+	return nil
 }

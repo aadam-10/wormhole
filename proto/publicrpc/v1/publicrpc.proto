@@ -72,6 +72,12 @@ enum ChainID {
   CHAIN_ID_STELLAR = 61;
   CHAIN_ID_TON = 62;
   CHAIN_ID_MOCA = 63;
+  CHAIN_ID_MEGAETH = 64;
+  CHAIN_ID_DOGECOIN = 65;
+  CHAIN_ID_XRPL = 66;
+  CHAIN_ID_ZEROGRAVITY = 67;
+  CHAIN_ID_TEMPO = 68;
+  CHAIN_ID_NEXUS = 69;
   CHAIN_ID_WORMCHAIN = 3104;
   CHAIN_ID_COSMOSHUB = 4000;
   CHAIN_ID_EVMOS = 4001;
@@ -90,6 +96,8 @@ enum ChainID {
   CHAIN_ID_HOLESKY = 10006;
   CHAIN_ID_POLYGON_SEPOLIA = 10007;
   // OBSOLETE: CHAIN_ID_MONAD_DEVNET = 10008;
+  CHAIN_ID_MONAD_TESTNET = 10009;
+  CHAIN_ID_HYPERCORE = 65000;
 }
 
 // MessageID is a VAA's globally unique identifier (see data availability design document).
@@ -133,6 +141,16 @@ service PublicRPCService {
 
   rpc GovernorGetTokenList(GovernorGetTokenListRequest) returns (GovernorGetTokenListResponse) {
     option (google.api.http) = {get: "/v1/governor/token_list"};
+  }
+
+  // GetSignedManagerTransaction returns the aggregated manager signatures for a given VAA ID.
+  rpc GetSignedManagerTransaction(GetSignedManagerTransactionRequest) returns (GetSignedManagerTransactionResponse) {
+    option (google.api.http) = {get: "/v1/manager/signed_vaa/{message_id.emitter_chain}/{message_id.emitter_address}/{message_id.sequence}"};
+  }
+
+  // GetSignedManagerTransactionByHash returns the aggregated manager signatures for a given VAA hash.
+  rpc GetSignedManagerTransactionByHash(GetSignedManagerTransactionByHashRequest) returns (GetSignedManagerTransactionByHashResponse) {
+    option (google.api.http) = {get: "/v1/manager/signed_vaa/{vaa_hash}"};
   }
 }
 
@@ -228,4 +246,60 @@ message GovernorGetTokenListResponse {
 
   // There is an entry for each token that applies to the notional TVL calcuation.
   repeated Entry entries = 1;
+}
+
+// Manager service messages
+
+message GetSignedManagerTransactionRequest {
+  MessageID message_id = 1;
+}
+
+message GetSignedManagerTransactionByHashRequest {
+  // Hex-encoded VAA hash.
+  string vaa_hash = 1;
+}
+
+message GetSignedManagerTransactionResponse {
+  // VAA hash in hex format.
+  string vaa_hash = 1;
+  // VAA ID in format "{chain}/{emitter}/{sequence}".
+  string vaa_id = 2;
+  // Destination chain for the transaction.
+  uint32 destination_chain = 3;
+  // Manager set index.
+  uint32 manager_set_index = 4;
+  // Number of signatures required (M in M-of-N).
+  uint32 required = 5;
+  // Total number of signers (N in M-of-N).
+  uint32 total = 6;
+  // Whether enough signatures have been collected.
+  bool is_complete = 7;
+  // Signatures collected so far, keyed by signer index.
+  repeated ManagerSignerEntry signatures = 8;
+}
+
+message GetSignedManagerTransactionByHashResponse {
+  // VAA hash in hex format.
+  string vaa_hash = 1;
+  // VAA ID in format "{chain}/{emitter}/{sequence}".
+  string vaa_id = 2;
+  // Destination chain for the transaction.
+  uint32 destination_chain = 3;
+  // Manager set index.
+  uint32 manager_set_index = 4;
+  // Number of signatures required (M in M-of-N).
+  uint32 required = 5;
+  // Total number of signers (N in M-of-N).
+  uint32 total = 6;
+  // Whether enough signatures have been collected.
+  bool is_complete = 7;
+  // Signatures collected so far, keyed by signer index.
+  repeated ManagerSignerEntry signatures = 8;
+}
+
+message ManagerSignerEntry {
+  // Signer index within the manager set.
+  uint32 signer_index = 1;
+  // Signatures for each input UTXO.
+  repeated bytes signatures = 2;
 }

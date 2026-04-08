@@ -24,13 +24,14 @@
 /relayer/generic_relayer @nonergodic @gator-boi
 /scripts/ @evan-gray @kcsongor @djb15
 /sdk/ @evan-gray @kev1n-peters @panoel @SEJeff @fergarrui
+/scripts/clippy.sh @evan-gray @kcsongor @djb15 @johnsaigle
 /sdk/js-proto-node/ @evan-gray @kev1n-peters
 /sdk/js-proto-web/ @evan-gray @kev1n-peters
 /sdk/js-query/ @evan-gray @kev1n-peters
 /sdk/js-wasm/ @evan-gray @kev1n-peters
 /sdk/js/ @evan-gray @kev1n-peters @panoel
 /sdk/rust/ @Daniel-Aaron-Bloom
-/sdk/vaa/ @evan-gray @panoel @SEJeff
+/sdk/vaa/ @evan-gray @panoel @SEJeff @fergarrui
 /spydk/ @evan-gray
 /testing/ @evan-gray
 /wormchain/contracts/tools/ @evan-gray @kev1n-peters @panoel
@@ -69,7 +70,7 @@
 
 ## Governor
 
-/node/pkg/governor/ @SEJeff @djb15 @johnsaigle @mdulin2 @pleasew8t
+/node/pkg/governor/ @SEJeff @djb15 @johnsaigle @mdulin2 @pleasew8t @bemic
 
 ## Gateway Relayer
 
@@ -120,11 +121,16 @@
 ## Hacks / Tools
 
 /node/hack/ @panoel @evan-gray
-/node/hack/governor @SEJeff @djb15 @johnsaigle @mdulin2 @pleasew8t
+/node/hack/governor @SEJeff @djb15 @johnsaigle @mdulin2 @pleasew8t @bemic
 
 ## Documentation
 
 /docs @evan-gray @SEJeff
+/docs/transfer-verifier.md @djb15 @johnsaigle @mdulin2 @pleasew8t
+/docs/notary.md @djb15 @johnsaigle @mdulin2 @pleasew8t
+
+SECURITY.md @djb15 @johnsaigle @mdulin2 @pleasew8t @bemic
+SECURITY_CONTEXT.md @djb15 @johnsaigle @mdulin2 @pleasew8t @bemic
 
 ## Audit Reports
 

@@ -11,6 +11,7 @@ import (
 )
 
 // handleReobservationRequest performs a reobservation request and publishes any observed transactions.
+// SECURITY: Only the finalized watcher handles reobservations. Set in configuration of watcher for Solana chains.
 func (s *SolanaWatcher) handleReobservationRequest(chainId vaa.ChainID, txID []byte, rpcClient *rpc.Client) (numObservations uint32, err error) {
 	if chainId != s.chainID {
 		return 0, fmt.Errorf("unexpected chain id: %v", chainId)
@@ -37,6 +38,14 @@ func (s *SolanaWatcher) handleReobservationRequest(chainId vaa.ChainID, txID []b
 		cancel()
 		if err != nil {
 			return 0, fmt.Errorf("failed to get transaction for observation request: %v", err)
+		}
+
+		if metadataErr := validateTransactionMeta(result.Meta); metadataErr != nil {
+			s.logger.Error("skipping observation request",
+				zap.Stringer("signature", signature),
+				zap.String("reason", metadataErr.Error()),
+			)
+			return 0, metadataErr
 		}
 
 		tx, err := result.Transaction.GetTransaction()

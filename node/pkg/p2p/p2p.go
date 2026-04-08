@@ -81,15 +81,41 @@ var (
 			Name: "wormhole_p2p_drops",
 			Help: "Total number of messages that were dropped by libp2p",
 		})
+	p2pBatchesInvalidGuardian = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_batches_invalid_guardian_total",
+			Help: "Total number of observation batches rejected because guardian is not in the current guardian set",
+		})
+	p2pBatchesInvalidPeer = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_batches_invalid_peer_total",
+			Help: "Total number of observation batches rejected because P2P peer does not match guardian",
+		})
+	p2pBatchesNoHeartbeat = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_batches_no_heartbeat_total",
+			Help: "Total number of observation batches rejected because no heartbeat received from guardian",
+		})
+	p2pBatchesOversized = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_batches_oversized_total",
+			Help: "Total number of observation batches rejected for exceeding max size",
+		})
 )
 
 var heartbeatMessagePrefix = []byte("heartbeat|")
 
 var signedObservationRequestPrefix = []byte("signed_observation_request|")
 
+var signedDelegateObservationPrefix = []byte("signed_delegate_observation_000000|")
+
+var signedManagerTransactionPrefix = []byte("signed_manager_transaction_0000000|")
+
 // heartbeatMaxTimeDifference specifies the maximum time difference between the local clock and the timestamp in incoming heartbeat messages. Heartbeats that are this old or this much into the future will be dropped. This value should encompass clock skew and network delay.
 var heartbeatMaxTimeDifference = time.Minute * 15
 var observationRequestMaxTimeDifference = time.Minute * 15
+var delegateObservationMaxTimeDifference = time.Minute * 15
+var managerTransactionMaxTimeDifference = time.Minute * 15
 
 func heartbeatDigest(b []byte) eth_common.Hash {
 	return ethcrypto.Keccak256Hash(append(heartbeatMessagePrefix, b...))
@@ -97,6 +123,14 @@ func heartbeatDigest(b []byte) eth_common.Hash {
 
 func signedObservationRequestDigest(b []byte) eth_common.Hash {
 	return ethcrypto.Keccak256Hash(append(signedObservationRequestPrefix, b...))
+}
+
+func signedDelegateObservationDigest(b []byte) eth_common.Hash {
+	return ethcrypto.Keccak256Hash(append(signedDelegateObservationPrefix, b...))
+}
+
+func signedManagerTransactionDigest(b []byte) eth_common.Hash {
+	return ethcrypto.Keccak256Hash(append(signedManagerTransactionPrefix, b...))
 }
 
 type Components struct {
@@ -311,9 +345,11 @@ func Run(params *RunParams) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		p2pMessagesSent.WithLabelValues("control").Add(0)
 		p2pMessagesSent.WithLabelValues("attestation").Add(0)
+		p2pMessagesSent.WithLabelValues("delegated_attestation").Add(0)
 		p2pMessagesSent.WithLabelValues("vaa").Add(0)
 		p2pReceiveChannelOverflow.WithLabelValues("observation").Add(0)
 		p2pReceiveChannelOverflow.WithLabelValues("batch_observation").Add(0)
+		p2pReceiveChannelOverflow.WithLabelValues("delegate_observation").Add(0)
 		p2pReceiveChannelOverflow.WithLabelValues("signed_vaa_with_quorum").Add(0)
 		p2pReceiveChannelOverflow.WithLabelValues("signed_observation_request").Add(0)
 
@@ -378,8 +414,8 @@ func Run(params *RunParams) func(ctx context.Context) error {
 		}
 
 		// These will only be non-nil if the application plans to listen for or publish to that topic.
-		var controlPubsubTopic, attestationPubsubTopic, vaaPubsubTopic *pubsub.Topic
-		var controlSubscription, attestationSubscription, vaaSubscription *pubsub.Subscription
+		var controlPubsubTopic, attestationPubsubTopic, delegatedAttestationPubsubTopic, vaaPubsubTopic, managerPubsubTopic *pubsub.Topic
+		var controlSubscription, attestationSubscription, delegatedAttestationSubscription, vaaSubscription, managerSubscription *pubsub.Subscription
 
 		// Set up the control channel. ////////////////////////////////////////////////////////////////////
 		if params.nodeName != "" || params.gossipControlSendC != nil || params.obsvReqSendC != nil || params.obsvReqRecvC != nil || params.signedGovCfgRecvC != nil || params.signedGovStatusRecvC != nil || params.gst.IsSubscribedToHeartbeats() {
@@ -431,6 +467,31 @@ func Run(params *RunParams) func(ctx context.Context) error {
 			}
 		}
 
+		// Set up the delegated attestation channel. ////////////////////////////////////////////////////////////////////
+		if params.gossipDelegatedAttestationSendC != nil || params.delegateObsvRecvC != nil {
+			delegatedAttestationTopic := fmt.Sprintf("%s/%s", params.networkID, "delegated_attestation")
+			logger.Info("joining the delegated attestation topic", zap.String("topic", delegatedAttestationTopic))
+			delegatedAttestationPubsubTopic, err = ps.Join(delegatedAttestationTopic)
+			if err != nil {
+				return fmt.Errorf("failed to join the delegated attestation topic: %w", err)
+			}
+
+			defer func() {
+				if err := delegatedAttestationPubsubTopic.Close(); err != nil && !errors.Is(err, context.Canceled) {
+					logger.Error("Error closing the delegated attestation topic", zap.Error(err))
+				}
+			}()
+
+			if params.delegateObsvRecvC != nil {
+				logger.Info("subscribing to the delegated attestation topic", zap.String("topic", delegatedAttestationTopic))
+				delegatedAttestationSubscription, err = delegatedAttestationPubsubTopic.Subscribe(pubsub.WithBufferSize(P2P_SUBSCRIPTION_BUFFER_SIZE))
+				if err != nil {
+					return fmt.Errorf("failed to subscribe to the delegated attestation topic: %w", err)
+				}
+				defer delegatedAttestationSubscription.Cancel()
+			}
+		}
+
 		// Set up the VAA channel. ////////////////////////////////////////////////////////////////////
 		if params.gossipVaaSendC != nil || params.signedIncomingVaaRecvC != nil {
 			vaaTopic := fmt.Sprintf("%s/%s", params.networkID, "broadcast")
@@ -453,6 +514,31 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					return fmt.Errorf("failed to subscribe to the vaa topic: %w", err)
 				}
 				defer vaaSubscription.Cancel()
+			}
+		}
+
+		// Set up the manager channel. ////////////////////////////////////////////////////////////////////
+		if params.managerTxSendC != nil || params.managerTxRecvC != nil {
+			managerTopic := fmt.Sprintf("%s/%s", params.networkID, "manager")
+			logger.Info("joining the manager topic", zap.String("topic", managerTopic))
+			managerPubsubTopic, err = ps.Join(managerTopic)
+			if err != nil {
+				return fmt.Errorf("failed to join the manager topic: %w", err)
+			}
+
+			defer func() {
+				if err := managerPubsubTopic.Close(); err != nil && !errors.Is(err, context.Canceled) {
+					logger.Error("Error closing the manager topic", zap.Error(err))
+				}
+			}()
+
+			if params.managerTxRecvC != nil {
+				logger.Info("subscribing to the manager topic", zap.String("topic", managerTopic))
+				managerSubscription, err = managerPubsubTopic.Subscribe(pubsub.WithBufferSize(P2P_SUBSCRIPTION_BUFFER_SIZE))
+				if err != nil {
+					return fmt.Errorf("failed to subscribe to the manager topic: %w", err)
+				}
+				defer managerSubscription.Cancel()
 			}
 		}
 
@@ -630,6 +716,40 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					if err != nil {
 						logger.Error("failed to publish message from attestation queue", zap.Error(err))
 					}
+				case msg := <-params.gossipDelegatedAttestationSendC:
+					// Sign the delegated observation using our node's guardian key.
+					digest := signedDelegateObservationDigest(msg)
+					sig, err := params.guardianSigner.Sign(ctx, digest.Bytes())
+					if err != nil {
+						panic(err)
+					}
+
+					sObsv := &gossipv1.SignedDelegateObservation{
+						DelegateObservation: msg,
+						Signature:           sig,
+						GuardianAddr:        ethcrypto.PubkeyToAddress(params.guardianSigner.PublicKey(ctx)).Bytes(),
+					}
+
+					envelope := &gossipv1.GossipMessage{
+						Message: &gossipv1.GossipMessage_SignedDelegateObservation{
+							SignedDelegateObservation: sObsv,
+						},
+					}
+					b, err := proto.Marshal(envelope)
+					if err != nil {
+						panic(err)
+					}
+
+					if delegatedAttestationPubsubTopic == nil {
+						panic("delegatedAttestationPubsubTopic should not be nil when gossipDelegatedAttestationSendC is set")
+					}
+					err = delegatedAttestationPubsubTopic.Publish(ctx, b)
+					p2pMessagesSent.WithLabelValues("delegated_attestation").Inc()
+					if err != nil {
+						logger.Error("failed to publish signed delegate observation", zap.Error(err))
+					} else {
+						logger.Info("published signed delegate observation", zap.Any("signed_delegate_observation", sObsv))
+					}
 				case msg := <-params.gossipVaaSendC:
 					if vaaPubsubTopic == nil {
 						panic("vaaPubsubTopic should not be nil when gossipVaaSendC is set")
@@ -638,6 +758,51 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					p2pMessagesSent.WithLabelValues("vaa").Inc()
 					if err != nil {
 						logger.Error("failed to publish message from vaa queue", zap.Error(err))
+					}
+				case msg := <-params.managerTxSendC:
+					if managerPubsubTopic == nil {
+						panic("managerPubsubTopic should not be nil when managerTxSendC is set")
+					}
+
+					// Serialize the ManagerTransaction
+					txBytes, err := proto.Marshal(msg)
+					if err != nil {
+						logger.Error("failed to marshal manager transaction", zap.Error(err))
+						continue
+					}
+
+					// Sign the serialized transaction using our node's guardian key
+					digest := signedManagerTransactionDigest(txBytes)
+					sig, err := params.guardianSigner.Sign(ctx, digest.Bytes())
+					if err != nil {
+						logger.Error("failed to sign manager transaction", zap.Error(err))
+						continue
+					}
+
+					// Create the signed wrapper
+					signedTx := &gossipv1.SignedManagerTransaction{
+						ManagerTransaction: txBytes,
+						Signature:          sig,
+						GuardianAddr:       ethcrypto.PubkeyToAddress(params.guardianSigner.PublicKey(ctx)).Bytes(),
+					}
+
+					// Wrap in gossip envelope
+					envelope := &gossipv1.GossipMessage{
+						Message: &gossipv1.GossipMessage_SignedManagerTransaction{
+							SignedManagerTransaction: signedTx,
+						},
+					}
+
+					b, err := proto.Marshal(envelope)
+					if err != nil {
+						logger.Error("failed to marshal signed manager transaction envelope", zap.Error(err))
+						continue
+					}
+
+					err = managerPubsubTopic.Publish(ctx, b)
+					p2pMessagesSent.WithLabelValues("manager").Inc()
+					if err != nil {
+						logger.Error("failed to publish message from manager queue", zap.Error(err))
 					}
 				case msg := <-params.obsvReqSendC:
 					b, err := proto.Marshal(msg)
@@ -884,11 +1049,35 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					switch m := msg.Message.(type) {
 					case *gossipv1.GossipMessage_SignedObservationBatch:
 						if params.batchObsvRecvC != nil {
+							// Get current guardian set for validation
+							gs := params.gst.Get()
+							if gs == nil {
+								logger.Warn("dropping observation batch - no guardian set initialized yet",
+									zap.String("from_peer", envelope.GetFrom().String()))
+								p2pMessagesReceived.WithLabelValues("no_guardian_set").Inc()
+								continue
+							}
+
+							// Validate batch using heartbeat-style security model
+							// This checks: guardian set membership, P2P peer identity, and batch size
+							if err := validateSignedObservationBatch(envelope.GetFrom(), m.SignedObservationBatch, gs, params.gst); err != nil {
+								logger.Warn("rejected invalid observation batch",
+									zap.Error(err),
+									zap.String("guardian_addr", hex.EncodeToString(m.SignedObservationBatch.Addr)),
+									zap.String("from_peer", envelope.GetFrom().String()),
+									zap.Int("observations", len(m.SignedObservationBatch.Observations)))
+								p2pMessagesReceived.WithLabelValues("invalid_batch").Inc()
+								continue
+							}
+
+							// Forward only validated batches to processor
 							if err := common.PostMsgWithTimestamp(m.SignedObservationBatch, params.batchObsvRecvC); err == nil {
 								p2pMessagesReceived.WithLabelValues("batch_observation").Inc()
 							} else {
 								if params.components.WarnChannelOverflow {
-									logger.Warn("Ignoring SignedObservationBatch because batchObsvRecvC is full", zap.String("addr", hex.EncodeToString(m.SignedObservationBatch.Addr)))
+									logger.Error("Ignoring SignedObservationBatch because batchObsvRecvC is full",
+										zap.String("guardian_addr", hex.EncodeToString(m.SignedObservationBatch.Addr)),
+										zap.String("from_peer", envelope.GetFrom().String()))
 								}
 								p2pReceiveChannelOverflow.WithLabelValues("batch_observation").Inc()
 							}
@@ -896,6 +1085,94 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					default:
 						p2pMessagesReceived.WithLabelValues("unknown").Inc()
 						logger.Warn("received unknown message type on attestation topic (running outdated software?)",
+							zap.Any("payload", msg.Message),
+							zap.Binary("raw", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+					}
+				}
+			}()
+		}
+
+		// This routine processes delegated attestation messages received from gossip. //////////////////////////////////////////////
+		if delegatedAttestationSubscription != nil {
+			go func() {
+				for {
+					envelope, err := delegatedAttestationSubscription.Next(ctx) // Note: sub.Next(ctx) will return an error once ctx is canceled
+					if err != nil {
+						errC <- fmt.Errorf("failed to receive pubsub message on delegated attestation topic: %w", err) //nolint:channelcheck // The runnable will exit anyway
+						return
+					}
+
+					var msg gossipv1.GossipMessage
+					err = proto.Unmarshal(envelope.Data, &msg)
+					if err != nil {
+						logger.Info("received invalid message on delegated attestation topic",
+							zap.Binary("data", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+						p2pMessagesReceived.WithLabelValues("invalid").Inc()
+						continue
+					}
+
+					if envelope.GetFrom() == h.ID() {
+						if logger.Level().Enabled(zapcore.DebugLevel) {
+							logger.Debug("received message from ourselves on delegated attestation topic, ignoring", zap.Any("payload", msg.Message))
+						}
+						p2pMessagesReceived.WithLabelValues("loopback").Inc()
+						continue
+					}
+
+					if logger.Level().Enabled(zapcore.DebugLevel) {
+						logger.Debug("received message on delegated attestation topic",
+							zap.Any("payload", msg.Message),
+							zap.Binary("raw", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+					}
+
+					switch m := msg.Message.(type) {
+					case *gossipv1.GossipMessage_SignedDelegateObservation:
+						if params.delegateObsvRecvC != nil {
+							d := m.SignedDelegateObservation
+							gs := params.gst.Get()
+							if gs == nil {
+								if logger.Level().Enabled(zapcore.DebugLevel) {
+									logger.Debug("dropping SignedDelegateObservation - no guardian set",
+										zap.Any("value", d),
+										zap.String("from", envelope.GetFrom().String()),
+									)
+								}
+								break
+							}
+
+							// SECURITY: The p2p signature on SignedDelegateObservation is verified in processSignedDelegateObservation. The processor
+							// assumes this verification has already occurred. Do not bypass this check, or untrusted data may reach the processor.
+							_, err := processSignedDelegateObservation(d, gs)
+							if err != nil {
+								p2pMessagesReceived.WithLabelValues("invalid_signed_delegate_observation").Inc()
+								logger.Error("invalid signed delegate observation received",
+									zap.Error(err),
+									zap.Any("payload", msg.Message),
+									zap.Any("value", d),
+									zap.Binary("raw", envelope.Data),
+									zap.String("from", envelope.GetFrom().String()))
+							} else {
+								if logger.Level().Enabled(zapcore.DebugLevel) {
+									logger.Debug("valid signed delegate observation received", zap.Any("value", d), zap.String("from", envelope.GetFrom().String()))
+								}
+
+								select {
+								case params.delegateObsvRecvC <- d:
+									p2pMessagesReceived.WithLabelValues("delegate_observation").Inc()
+								default:
+									if params.components.WarnChannelOverflow {
+										logger.Warn("Ignoring SignedDelegateObservation because delegateObsvRecvC is full", zap.String("guardian_addr", hex.EncodeToString(d.GuardianAddr)))
+									}
+									p2pReceiveChannelOverflow.WithLabelValues("delegate_observation").Inc()
+								}
+							}
+						}
+					default:
+						p2pMessagesReceived.WithLabelValues("unknown").Inc()
+						logger.Warn("received unknown message type on delegated attestation topic (running outdated software?)",
 							zap.Any("payload", msg.Message),
 							zap.Binary("raw", envelope.Data),
 							zap.String("from", envelope.GetFrom().String()))
@@ -959,6 +1236,81 @@ func Run(params *RunParams) func(ctx context.Context) error {
 					default:
 						p2pMessagesReceived.WithLabelValues("unknown").Inc()
 						logger.Warn("received unknown message type on vaa topic (running outdated software?)",
+							zap.Any("payload", msg.Message),
+							zap.Binary("raw", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+					}
+				}
+			}()
+		}
+
+		// This routine processes signed manager transaction messages received from gossip. //////////////////////////////////////////////
+		if managerSubscription != nil {
+			go func() {
+				for {
+					envelope, err := managerSubscription.Next(ctx) // Note: sub.Next(ctx) will return an error once ctx is canceled
+					if err != nil {
+						errC <- fmt.Errorf("failed to receive pubsub message on manager topic: %w", err) //nolint:channelcheck // The runnable will exit anyway
+						return
+					}
+
+					var msg gossipv1.GossipMessage
+					err = proto.Unmarshal(envelope.Data, &msg)
+					if err != nil {
+						logger.Info("received invalid message on manager topic",
+							zap.Binary("data", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+						p2pMessagesReceived.WithLabelValues("invalid").Inc()
+						continue
+					}
+
+					if envelope.GetFrom() == h.ID() {
+						if logger.Level().Enabled(zapcore.DebugLevel) {
+							logger.Debug("received message from ourselves on manager topic, ignoring", zap.Any("payload", msg.Message))
+						}
+						p2pMessagesReceived.WithLabelValues("loopback").Inc()
+						continue
+					}
+
+					if logger.Level().Enabled(zapcore.DebugLevel) {
+						logger.Debug("received message on manager topic",
+							zap.Any("payload", msg.Message),
+							zap.Binary("raw", envelope.Data),
+							zap.String("from", envelope.GetFrom().String()))
+					}
+
+					switch m := msg.Message.(type) {
+					case *gossipv1.GossipMessage_SignedManagerTransaction:
+						if params.managerTxRecvC != nil {
+							// Verify the guardian signature
+							gs := params.gst.Get()
+							if gs == nil {
+								if logger.Level().Enabled(zapcore.DebugLevel) {
+									logger.Debug("dropping SignedManagerTransaction - no guardian set",
+										zap.String("from", envelope.GetFrom().String()))
+								}
+								break
+							}
+							managerTx, err := processSignedManagerTransaction(m.SignedManagerTransaction, gs)
+							if err != nil {
+								p2pMessagesReceived.WithLabelValues("invalid_signed_manager_transaction").Inc()
+								if logger.Level().Enabled(zapcore.DebugLevel) {
+									logger.Debug("invalid signed manager transaction received",
+										zap.Error(err),
+										zap.String("from", envelope.GetFrom().String()))
+								}
+								break
+							}
+							select {
+							case params.managerTxRecvC <- managerTx:
+								p2pMessagesReceived.WithLabelValues("signed_manager_transaction").Inc()
+							default:
+								p2pReceiveChannelOverflow.WithLabelValues("signed_manager_transaction").Inc()
+							}
+						}
+					default:
+						p2pMessagesReceived.WithLabelValues("unknown").Inc()
+						logger.Warn("received unknown message type on manager topic (running outdated software?)",
 							zap.Any("payload", msg.Message),
 							zap.Binary("raw", envelope.Data),
 							zap.String("from", envelope.GetFrom().String()))
@@ -1061,6 +1413,54 @@ func processSignedHeartbeat(from peer.ID, s *gossipv1.SignedHeartbeat, gs *commo
 	return &h, nil
 }
 
+// validateSignedObservationBatch validates a SignedObservationBatch message using the same security model as heartbeats.
+// It verifies that:
+// 1. The guardian address is in the current guardian set
+// 2. The P2P peer sending the batch matches a known peer for that guardian (from heartbeats)
+// 3. The batch size is within limits
+func validateSignedObservationBatch(
+	from peer.ID,
+	batch *gossipv1.SignedObservationBatch,
+	gs *common.GuardianSet,
+	gst *common.GuardianSetState,
+) error {
+	// 1. Check guardian set membership
+	guardianAddr := eth_common.BytesToAddress(batch.Addr)
+	_, ok := gs.KeyIndex(guardianAddr)
+	if !ok {
+		p2pBatchesInvalidGuardian.Inc()
+		return fmt.Errorf("guardian %s not in current guardian set", guardianAddr.Hex())
+	}
+
+	// 2. Verify P2P peer matches known guardian peer(s) from heartbeats
+	knownPeers := gst.LastHeartbeat(guardianAddr)
+	if len(knownPeers) == 0 {
+		// No heartbeat received from this guardian yet
+		// Reject - heartbeats are sent every second, so this should sync quickly
+		p2pBatchesNoHeartbeat.Inc()
+		return fmt.Errorf("no heartbeat received from guardian %s, cannot verify P2P peer identity", guardianAddr.Hex())
+	}
+
+	// Check if the sending peer is one of the known peers for this guardian
+	if _, found := knownPeers[from]; !found {
+		p2pBatchesInvalidPeer.Inc()
+		return fmt.Errorf("batch from P2P peer %s does not match known peers for guardian %s", from.String(), guardianAddr.Hex())
+	}
+
+	// 3. Validate batch size
+	if len(batch.Observations) > MaxObservationBatchSize {
+		p2pBatchesOversized.Inc()
+		return fmt.Errorf("batch exceeds max size: %d > %d", len(batch.Observations), MaxObservationBatchSize)
+	}
+
+	// 4. Validate batch not empty
+	if len(batch.Observations) == 0 {
+		return fmt.Errorf("empty observation batch")
+	}
+
+	return nil
+}
+
 func processSignedObservationRequest(s *gossipv1.SignedObservationRequest, gs *common.GuardianSet) (*gossipv1.ObservationRequest, error) {
 	envelopeAddr := eth_common.BytesToAddress(s.GuardianAddr)
 	idx, ok := gs.KeyIndex(envelopeAddr)
@@ -1097,13 +1497,92 @@ func processSignedObservationRequest(s *gossipv1.SignedObservationRequest, gs *c
 	// TODO: implement per-guardian rate limiting
 
 	// Perform timestamp validation
-	// Since this is a version upgrade, we need to accept a timestamp of 0.
-	// Shortly after all have upgraded, we will remove this conditional check.
-	if h.Timestamp != 0 {
-		if time.Until(time.Unix(0, h.Timestamp)).Abs() > observationRequestMaxTimeDifference {
-			return nil, fmt.Errorf("reobservation request is too old or too far into the future")
-		}
+	if time.Until(time.Unix(0, h.Timestamp)).Abs() > observationRequestMaxTimeDifference {
+		return nil, fmt.Errorf("reobservation request is too old or too far into the future")
 	}
 
 	return &h, nil
+}
+
+func processSignedDelegateObservation(d *gossipv1.SignedDelegateObservation, gs *common.GuardianSet) (*gossipv1.DelegateObservation, error) {
+	envelopeAddr := eth_common.BytesToAddress(d.GuardianAddr)
+	idx, ok := gs.KeyIndex(envelopeAddr)
+	if !ok {
+		return nil, fmt.Errorf("invalid message: %s not in guardian set", envelopeAddr)
+	}
+	pk := gs.Keys[idx]
+
+	// SECURITY: see whitepapers/0009_guardian_signer.md
+	if len(signedDelegateObservationPrefix)+len(d.DelegateObservation) < 34 {
+		return nil, fmt.Errorf("invalid delegate observation: too short")
+	}
+
+	digest := signedDelegateObservationDigest(d.DelegateObservation)
+
+	pubKey, err := ethcrypto.Ecrecover(digest.Bytes(), d.Signature)
+	if err != nil {
+		return nil, errors.New("failed to recover public key")
+	}
+
+	signerAddr := eth_common.BytesToAddress(ethcrypto.Keccak256(pubKey[1:])[12:])
+	if pk != signerAddr {
+		return nil, fmt.Errorf("invalid signer: %v", signerAddr)
+	}
+
+	var h gossipv1.DelegateObservation
+	err = proto.Unmarshal(d.DelegateObservation, &h)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal delegate observation: %w", err)
+	}
+
+	if time.Until(time.Unix(h.SentTimestamp, 0)).Abs() > delegateObservationMaxTimeDifference {
+		return nil, fmt.Errorf("delegate observation is too old or too far into the future")
+	}
+
+	if eth_common.BytesToAddress(h.GuardianAddr) != signerAddr {
+		return nil, fmt.Errorf("GuardianAddr in delegate observation does not match signerAddr")
+	}
+
+	return &h, nil
+}
+
+func processSignedManagerTransaction(s *gossipv1.SignedManagerTransaction, gs *common.GuardianSet) (*gossipv1.ManagerTransaction, error) {
+	envelopeAddr := eth_common.BytesToAddress(s.GuardianAddr)
+	idx, ok := gs.KeyIndex(envelopeAddr)
+	var pk eth_common.Address
+	if !ok {
+		return nil, fmt.Errorf("invalid message: %s not in guardian set", envelopeAddr)
+	} else {
+		pk = gs.Keys[idx]
+	}
+
+	// SECURITY: see whitepapers/0009_guardian_signer.md
+	if len(signedManagerTransactionPrefix)+len(s.ManagerTransaction) < 34 {
+		return nil, fmt.Errorf("invalid manager transaction: too short")
+	}
+
+	digest := signedManagerTransactionDigest(s.ManagerTransaction)
+
+	pubKey, err := ethcrypto.Ecrecover(digest.Bytes(), s.Signature)
+	if err != nil {
+		return nil, errors.New("failed to recover public key")
+	}
+
+	signerAddr := eth_common.BytesToAddress(ethcrypto.Keccak256(pubKey[1:])[12:])
+	if pk != signerAddr {
+		return nil, fmt.Errorf("invalid signer: %v", signerAddr)
+	}
+
+	var tx gossipv1.ManagerTransaction
+	err = proto.Unmarshal(s.ManagerTransaction, &tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal manager transaction: %w", err)
+	}
+
+	// Perform timestamp validation to prevent replay attacks
+	if time.Until(time.Unix(tx.SentTimestamp, 0)).Abs() > managerTransactionMaxTimeDifference {
+		return nil, fmt.Errorf("manager transaction is too old or too far into the future")
+	}
+
+	return &tx, nil
 }

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/certusone/wormhole/node/pkg/guardiansigner"
 	"github.com/certusone/wormhole/node/pkg/watchers"
 	"github.com/certusone/wormhole/node/pkg/watchers/ibc"
@@ -72,8 +73,9 @@ var (
 	guardianKeyPath   *string
 	guardianSignerUri *string
 
-	ethRPC      *string
-	ethContract *string
+	ethRPC                        *string
+	ethContract                   *string
+	ethDelegatedGuardiansContract *string
 
 	bscRPC      *string
 	bscContract *string
@@ -224,6 +226,15 @@ var (
 	mocaRPC      *string
 	mocaContract *string
 
+	megaEthRPC      *string
+	megaEthContract *string
+
+	zeroGravityRPC      *string
+	zeroGravityContract *string
+
+	nexusRPC      *string
+	nexusContract *string
+
 	sepoliaRPC      *string
 	sepoliaContract *string
 
@@ -241,6 +252,9 @@ var (
 
 	polygonSepoliaRPC      *string
 	polygonSepoliaContract *string
+
+	monadTestnetRPC      *string
+	monadTestnetContract *string
 
 	logLevel                *string
 	publicRpcLogDetailStr   *string
@@ -299,6 +313,9 @@ var (
 	// featureFlags are additional static flags that should be published in P2P heartbeats.
 	featureFlags  []string
 	notaryEnabled *bool
+
+	managerServiceEnabled    *bool
+	dogecoinManagerSignerUri *string
 )
 
 func init() {
@@ -326,6 +343,7 @@ func init() {
 
 	ethRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "ethRPC", "Ethereum RPC URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	ethContract = NodeCmd.Flags().String("ethContract", "", "Ethereum contract address")
+	ethDelegatedGuardiansContract = NodeCmd.Flags().String("ethDelegatedGuardiansContract", "", "Ethereum delegated guardians contract address")
 
 	bscRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "bscRPC", "Binance Smart Chain RPC URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	bscContract = NodeCmd.Flags().String("bscContract", "", "Binance Smart Chain contract address")
@@ -474,8 +492,17 @@ func init() {
 	creditCoinRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "creditCoinRPC", "CREDITCOIN RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	creditCoinContract = NodeCmd.Flags().String("creditCoinContract", "", "CreditCoin contract address")
 
-	mocaRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "MocaRPC", "Moca RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
+	mocaRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "mocaRPC", "Moca RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	mocaContract = NodeCmd.Flags().String("mocaContract", "", "Moca contract address")
+
+	megaEthRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "megaEthRPC", "MegaETH RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
+	megaEthContract = NodeCmd.Flags().String("megaEthContract", "", "MegaETH contract address")
+
+	zeroGravityRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "zeroGravityRPC", "ZeroGravity RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
+	zeroGravityContract = NodeCmd.Flags().String("zeroGravityContract", "", "ZeroGravity contract address")
+
+	nexusRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "nexusRPC", "Nexus RPC_URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
+	nexusContract = NodeCmd.Flags().String("nexusContract", "", "Nexus contract address")
 
 	arbitrumSepoliaRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "arbitrumSepoliaRPC", "Arbitrum on Sepolia RPC URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	arbitrumSepoliaContract = NodeCmd.Flags().String("arbitrumSepoliaContract", "", "Arbitrum on Sepolia contract address")
@@ -488,6 +515,9 @@ func init() {
 
 	polygonSepoliaRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "polygonSepoliaRPC", "Polygon on Sepolia RPC URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
 	polygonSepoliaContract = NodeCmd.Flags().String("polygonSepoliaContract", "", "Polygon on Sepolia contract address")
+
+	monadTestnetRPC = node.RegisterFlagWithValidationOrFail(NodeCmd, "monadTestnetRPC", "Monad testnet RPC URL", "ws://eth-devnet:8545", []string{"ws", "wss"})
+	monadTestnetContract = NodeCmd.Flags().String("monadTestnetContract", "", "Monad testnet contract address")
 
 	logLevel = NodeCmd.Flags().String("logLevel", "info", "Logging level (debug, info, warn, error, dpanic, panic, fatal)")
 	publicRpcLogDetailStr = NodeCmd.Flags().String("publicRpcLogDetail", "full", "The detail with which public RPC requests shall be logged (none=no logging, minimal=only log gRPC methods, full=log gRPC method, payload (up to 200 bytes) and user agent (up to 200 bytes))")
@@ -535,6 +565,9 @@ func init() {
 	transferVerifierEnabledChainIDs = NodeCmd.Flags().UintSlice("transferVerifierEnabledChainIDs", make([]uint, 0), "Transfer Verifier will be enabled for these chain IDs (comma-separated)")
 
 	notaryEnabled = NodeCmd.Flags().Bool("notaryEnabled", false, "Run the notary")
+
+	managerServiceEnabled = NodeCmd.Flags().Bool("managerServiceEnabled", false, "Run the manager service")
+	dogecoinManagerSignerUri = NodeCmd.Flags().String("dogecoinManagerSignerUri", "", "Dogecoin manager signer URI")
 }
 
 var (
@@ -879,6 +912,8 @@ func runNode(cmd *cobra.Command, args []string) {
 	*plasmaContract = checkEvmArgs(logger, *plasmaRPC, *plasmaContract, vaa.ChainIDPlasma)
 	*creditCoinContract = checkEvmArgs(logger, *creditCoinRPC, *creditCoinContract, vaa.ChainIDCreditCoin)
 	*mocaContract = checkEvmArgs(logger, *mocaRPC, *mocaContract, vaa.ChainIDMoca)
+	*megaEthContract = checkEvmArgs(logger, *megaEthRPC, *megaEthContract, vaa.ChainIDMegaETH)
+	*zeroGravityContract = checkEvmArgs(logger, *zeroGravityRPC, *zeroGravityContract, vaa.ChainIDZeroGravity)
 
 	// These chains will only ever be testnet / devnet.
 	*sepoliaContract = checkEvmArgs(logger, *sepoliaRPC, *sepoliaContract, vaa.ChainIDSepolia)
@@ -887,6 +922,8 @@ func runNode(cmd *cobra.Command, args []string) {
 	*optimismSepoliaContract = checkEvmArgs(logger, *optimismSepoliaRPC, *optimismSepoliaContract, vaa.ChainIDOptimismSepolia)
 	*holeskyContract = checkEvmArgs(logger, *holeskyRPC, *holeskyContract, vaa.ChainIDHolesky)
 	*polygonSepoliaContract = checkEvmArgs(logger, *polygonSepoliaRPC, *polygonSepoliaContract, vaa.ChainIDPolygonSepolia)
+	*monadTestnetContract = checkEvmArgs(logger, *monadTestnetRPC, *monadTestnetContract, vaa.ChainIDMonadTestnet)
+	*nexusContract = checkEvmArgs(logger, *nexusRPC, *nexusContract, vaa.ChainIDNexus)
 
 	if !argsConsistent([]string{*solanaContract, *solanaRPC}) {
 		logger.Fatal("Both --solanaContract and --solanaRPC must be set or both unset")
@@ -1074,7 +1111,11 @@ func runNode(cmd *cobra.Command, args []string) {
 		rpcMap["optimismSepoliaRPC"] = *optimismSepoliaRPC
 		rpcMap["holeskyRPC"] = *holeskyRPC
 		rpcMap["polygonSepoliaRPC"] = *polygonSepoliaRPC
+		rpcMap["monadTestnetRPC"] = *monadTestnetRPC
 	}
+
+	// Special or bespoke chains is in the 60000+ range.
+	// ChainIDHyperCore is not supported in the guardian.
 
 	// Other, non-chain specific parameters go here.
 	rpcMap["accountantWS"] = *accountantWS
@@ -1248,14 +1289,20 @@ func runNode(cmd *cobra.Command, args []string) {
 	watcherConfigs := []watchers.WatcherConfig{}
 
 	if shouldStart(ethRPC) {
+		dgContract := *ethDelegatedGuardiansContract
+		if dgContract != "" {
+			logger.Info("Ethereum delegated guardians contract configured", zap.String("address", dgContract))
+			featureFlags = append(featureFlags, fmt.Sprintf("dgset:%s", dgContract))
+		}
 		wc := &evm.WatcherConfig{
-			NetworkID:              "eth",
-			ChainID:                vaa.ChainIDEthereum,
-			Rpc:                    *ethRPC,
-			Contract:               *ethContract,
-			GuardianSetUpdateChain: true,
-			CcqBackfillCache:       *ccqBackfillCache,
-			TxVerifierEnabled:      slices.Contains(txVerifierChains, vaa.ChainIDEthereum),
+			NetworkID:                  "eth",
+			ChainID:                    vaa.ChainIDEthereum,
+			Rpc:                        *ethRPC,
+			Contract:                   *ethContract,
+			GuardianSetUpdateChain:     true,
+			DelegatedGuardiansContract: dgContract,
+			CcqBackfillCache:           *ccqBackfillCache,
+			TxVerifierEnabled:          slices.Contains(txVerifierChains, vaa.ChainIDEthereum),
 		}
 
 		watcherConfigs = append(watcherConfigs, wc)
@@ -1612,6 +1659,28 @@ func runNode(cmd *cobra.Command, args []string) {
 		watcherConfigs = append(watcherConfigs, wc)
 	}
 
+	if shouldStart(megaEthRPC) {
+		wc := &evm.WatcherConfig{
+			NetworkID:        "megaeth",
+			ChainID:          vaa.ChainIDMegaETH,
+			Rpc:              *megaEthRPC,
+			Contract:         *megaEthContract,
+			CcqBackfillCache: *ccqBackfillCache,
+		}
+		watcherConfigs = append(watcherConfigs, wc)
+	}
+
+	if shouldStart(zeroGravityRPC) {
+		wc := &evm.WatcherConfig{
+			NetworkID:        "zerogravity",
+			ChainID:          vaa.ChainIDZeroGravity,
+			Rpc:              *zeroGravityRPC,
+			Contract:         *zeroGravityContract,
+			CcqBackfillCache: *ccqBackfillCache,
+		}
+		watcherConfigs = append(watcherConfigs, wc)
+	}
+
 	if shouldStart(terraWS) {
 		if env != common.UnsafeDevNet {
 			logger.Fatal("Terra classic is only allowed in unsafe dev mode")
@@ -1885,6 +1954,31 @@ func runNode(cmd *cobra.Command, args []string) {
 			watcherConfigs = append(watcherConfigs, wc)
 		}
 
+		if shouldStart(monadTestnetRPC) {
+			wc := &evm.WatcherConfig{
+				NetworkID:         "monad_testnet",
+				ChainID:           vaa.ChainIDMonadTestnet,
+				Rpc:               *monadTestnetRPC,
+				Contract:          *monadTestnetContract,
+				CcqBackfillCache:  *ccqBackfillCache,
+				TxVerifierEnabled: slices.Contains(txVerifierChains, vaa.ChainIDMonadTestnet),
+			}
+
+			watcherConfigs = append(watcherConfigs, wc)
+		}
+
+		if shouldStart(nexusRPC) {
+			wc := &evm.WatcherConfig{
+				NetworkID:        "nexus",
+				ChainID:          vaa.ChainIDNexus,
+				Rpc:              *nexusRPC,
+				Contract:         *nexusContract,
+				CcqBackfillCache: *ccqBackfillCache,
+			}
+
+			watcherConfigs = append(watcherConfigs, wc)
+		}
+
 	}
 
 	var ibcWatcherConfig *node.IbcWatcherConfig = nil
@@ -1907,18 +2001,42 @@ func runNode(cmd *cobra.Command, args []string) {
 		guardianAddrAsBytes = ethcrypto.PubkeyToAddress(guardianSigner.PublicKey(rootCtx)).Bytes()
 	}
 
+	// Initialize manager signers map
+	managerSigners := make(map[vaa.ChainID]guardiansigner.GuardianSigner)
+	if *dogecoinManagerSignerUri != "" {
+		// Ensure the manager signer is not the same as the guardian signer in non-devnet environments
+		if env != common.UnsafeDevNet && *dogecoinManagerSignerUri == *guardianSignerUri {
+			logger.Fatal("dogecoinManagerSignerUri must be different from guardianSignerUri in non-devnet environments")
+		}
+		dogecoinSigner, err := guardiansigner.NewGuardianSignerFromUriWithPurpose(rootCtx, *dogecoinManagerSignerUri, env == common.UnsafeDevNet, "manager-dogecoin")
+		if err != nil {
+			logger.Fatal("failed to create dogecoin manager signer", zap.Error(err))
+		}
+		managerSigners[vaa.ChainIDDogecoin] = dogecoinSigner
+
+		// Log the 33-byte compressed public key for use in P2SH multisig
+		pubKey := dogecoinSigner.PublicKey(rootCtx)
+		btcecPubKey, err := btcec.ParsePubKey(ethcrypto.FromECDSAPub(&pubKey))
+		if err != nil {
+			logger.Fatal("failed to parse dogecoin public key", zap.Error(err))
+		}
+		compressedPubKey := btcecPubKey.SerializeCompressed()
+		logger.Info("initialized dogecoin manager signer", zap.String("compressed_public_key", fmt.Sprintf("%x", compressedPubKey)))
+	}
+
 	guardianOptions := []*node.GuardianOption{
 		node.GuardianOptionDatabase(db),
 		node.GuardianOptionWatchers(watcherConfigs, ibcWatcherConfig),
 		node.GuardianOptionAccountant(*accountantWS, *accountantContract, *accountantCheckEnabled, accountantWormchainConn, *accountantNttContract, accountantNttWormchainConn),
 		node.GuardianOptionGovernor(*chainGovernorEnabled, *governorFlowCancelEnabled, *coinGeckoApiKey),
 		node.GuardianOptionNotary(*notaryEnabled),
+		node.GuardianOptionManagerService(*managerServiceEnabled, managerSigners, *ethRPC),
 		node.GuardianOptionGatewayRelayer(*gatewayRelayerContract, gatewayRelayerWormchainConn),
 		node.GuardianOptionQueryHandler(*ccqEnabled, *ccqAllowedRequesters),
 		node.GuardianOptionAdminService(*adminSocketPath, ethRPC, ethContract, rpcMap),
 		node.GuardianOptionStatusServer(*statusAddr),
 		node.GuardianOptionAlternatePublisher(guardianAddrAsBytes, *additionalPublishers),
-		node.GuardianOptionProcessor(*p2pNetworkID),
+		node.GuardianOptionProcessor(*p2pNetworkID, *ethDelegatedGuardiansContract != ""),
 
 		// Keep this last so that all of its dependencies are met.
 		node.GuardianOptionP2P(

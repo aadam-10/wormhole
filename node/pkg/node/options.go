@@ -12,7 +12,9 @@ import (
 	"github.com/certusone/wormhole/node/pkg/common"
 	guardianDB "github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/governor"
+	"github.com/certusone/wormhole/node/pkg/guardiansigner"
 	"github.com/certusone/wormhole/node/pkg/gwrelayer"
+	"github.com/certusone/wormhole/node/pkg/manager"
 	"github.com/certusone/wormhole/node/pkg/notary"
 	"github.com/certusone/wormhole/node/pkg/p2p"
 	"github.com/certusone/wormhole/node/pkg/processor"
@@ -21,6 +23,7 @@ import (
 	"github.com/certusone/wormhole/node/pkg/readiness"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
 	"github.com/certusone/wormhole/node/pkg/watchers"
+	"github.com/certusone/wormhole/node/pkg/watchers/evm"
 	"github.com/certusone/wormhole/node/pkg/watchers/ibc"
 	"github.com/certusone/wormhole/node/pkg/wormconn"
 	"github.com/gorilla/mux"
@@ -87,20 +90,18 @@ func GuardianOptionP2P(
 				featureFlagFuncs = append(featureFlagFuncs, ibc.GetFeatures)
 			}
 
-			params, err := p2p.NewRunParams(
-				bootstrapPeers,
-				networkId,
-				p2pKey,
-				g.gst,
-				g.rootCtxCancel,
+			// Build list of p2p options
+			opts := []p2p.RunOpt{
 				p2p.WithGuardianOptions(
 					nodeName,
 					g.guardianSigner,
 					g.batchObsvC.writeC,
+					g.delegateObsvC.writeC,
 					signedInC,
 					g.obsvReqC.writeC,
 					g.gossipControlSendC,
 					g.gossipAttestationSendC,
+					g.gossipDelegatedAttestationSendC,
 					g.gossipVaaSendC,
 					g.obsvReqSendC.readC,
 					g.acct,
@@ -118,6 +119,18 @@ func GuardianOptionP2P(
 					featureFlags,
 					featureFlagFuncs,
 				),
+			}
+			if g.managerService != nil {
+				opts = append(opts, p2p.WithManagerOptions(g.managerTxSendC, g.managerTxC.writeC))
+			}
+
+			params, err := p2p.NewRunParams(
+				bootstrapPeers,
+				networkId,
+				p2pKey,
+				g.gst,
+				g.rootCtxCancel,
+				opts...,
 			)
 			if err != nil {
 				return err
@@ -266,6 +279,32 @@ func GuardianOptionNotary(notaryEnabled bool) *GuardianOption {
 				g.notary = notary.NewNotary(ctx, logger, g.db, g.env)
 			} else {
 				logger.Info("notary is disabled")
+			}
+			return nil
+		}}
+}
+
+// GuardianOptionManagerService enables or disables the Manager Service.
+// The Manager Service subscribes to incoming VAAs and processes them.
+// The signers map contains chain-specific signers for manager operations.
+// The delegatedManagerSetRPC is the Ethereum RPC URL for fetching manager sets from the
+// DelegatedManagerSet contract.
+// Dependencies: db
+func GuardianOptionManagerService(managerServiceEnabled bool, signers map[vaa.ChainID]guardiansigner.GuardianSigner, delegatedManagerSetRPC string) *GuardianOption {
+	return &GuardianOption{
+		name:         "manager",
+		dependencies: []string{"db"},
+		f: func(ctx context.Context, logger *zap.Logger, g *G) error {
+			if managerServiceEnabled {
+				g.managerSigners = signers
+				var err error
+				g.managerService, err = manager.NewManagerService(ctx, logger, g.managerC.readC, g.env, signers, g.managerTxSendC, g.managerTxC.readC, g.db, delegatedManagerSetRPC)
+				if err != nil {
+					return fmt.Errorf("failed to create manager service: %w", err)
+				}
+				g.runnables["manager"] = g.managerService.Run
+			} else {
+				logger.Info("manager service is disabled")
 			}
 			return nil
 		}}
@@ -462,6 +501,11 @@ func GuardianOptionWatchers(watcherConfigs []watchers.WatcherConfig, ibcWatcherC
 					g.chainQueryReqC[wc.GetChainID()] = make(chan *query.PerChainQueryInternal, query.QueryRequestBufferSize)
 				}
 
+				// For EVM watchers, set the delegated guardian config channel
+				if evmWc, ok := wc.(*evm.WatcherConfig); ok {
+					evmWc.DgConfigC = g.dgConfigC.writeC
+				}
+
 				runnable, reobserver, err := wc.Create(chainMsgC[wc.GetChainID()], chainObsvReqC[wc.GetChainID()], g.chainQueryReqC[wc.GetChainID()], chainQueryResponseC[wc.GetChainID()], g.setC.writeC, g.env)
 
 				if err != nil {
@@ -540,6 +584,7 @@ func GuardianOptionAdminService(socketPath string, ethRpc *string, ethContract *
 				ethContract,
 				rpcMap,
 				g.reobservers,
+				g.managerService,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to create admin service: %w", err)
@@ -558,8 +603,8 @@ func GuardianOptionPublicRpcSocket(publicGRPCSocketPath string, publicRpcLogDeta
 		dependencies: []string{"db", "governor"},
 		f: func(ctx context.Context, logger *zap.Logger, g *G) error {
 			// local public grpc service socket
-			//nolint:contextcheck // We use context.Background() instead of ctx here because ctx is already canceled at this point and Shutdown would not work then.
-			publicrpcUnixService, publicrpcServer, err := publicrpcUnixServiceRunnable(logger, publicGRPCSocketPath, publicRpcLogDetail, g.db, g.gst, g.gov)
+			//nolint:contextcheck // Context is handled by gRPC interceptor chain in common.NewInstrumentedGRPCServer
+			publicrpcUnixService, publicrpcServer, err := publicrpcUnixServiceRunnable(logger, publicGRPCSocketPath, publicRpcLogDetail, g.db, g.gst, g.gov, g.managerService)
 			if err != nil {
 				return fmt.Errorf("failed to create publicrpc service: %w", err)
 			}
@@ -576,7 +621,7 @@ func GuardianOptionPublicrpcTcpService(publicRpc string, publicRpcLogDetail comm
 		name:         "publicrpc",
 		dependencies: []string{"db", "governor", "publicrpcsocket"},
 		f: func(ctx context.Context, logger *zap.Logger, g *G) error {
-			publicrpcService := publicrpcTcpServiceRunnable(logger, publicRpc, publicRpcLogDetail, g.db, g.gst, g.gov)
+			publicrpcService := publicrpcTcpServiceRunnable(logger, publicRpc, publicRpcLogDetail, g.db, g.gst, g.gov, g.managerService)
 			g.runnables["publicrpc"] = publicrpcService
 			return nil
 		}}
@@ -630,25 +675,34 @@ func GuardianOptionAlternatePublisher(guardianAddr []byte, configs []string) *Gu
 
 // GuardianOptionProcessor enables the default processor, which is required to make consensus on messages.
 // Dependencies: See below.
-func GuardianOptionProcessor(networkId string) *GuardianOption {
+func GuardianOptionProcessor(networkId string, delegatedGuardiansEnabled bool) *GuardianOption {
 	return &GuardianOption{
 		name: "processor",
-		// governor, accountant, and notary may be set to nil, but that choice needs to be made before the processor is configured
-		dependencies: []string{"accountant", "alternate-publisher", "db", "gateway-relayer", "governor", "notary"},
+		// governor, accountant, notary, and manager may be set to nil, but that choice needs to be made before the processor is configured
+		dependencies: []string{"accountant", "alternate-publisher", "manager", "db", "gateway-relayer", "governor", "notary"},
 
 		f: func(ctx context.Context, logger *zap.Logger, g *G) error {
+			// Only pass the manager channel if the manager service is enabled
+			var managerC chan<- *vaa.VAA
+			if g.managerService != nil {
+				managerC = g.managerC.writeC
+			}
 
 			g.runnables["processor"] = processor.NewProcessor(ctx,
 				g.db,
 				g.msgC.readC,
 				g.setC.readC,
+				g.dgConfigC.readC,
 				g.gossipAttestationSendC,
+				g.gossipDelegatedAttestationSendC,
 				g.gossipVaaSendC,
 				g.batchObsvC.readC,
+				g.delegateObsvC.readC,
 				g.obsvReqSendC.writeC,
 				g.signedInC.readC,
 				g.guardianSigner,
 				g.gst,
+				g.dgc,
 				g.gov,
 				g.acct,
 				g.acctC.readC,
@@ -656,6 +710,8 @@ func GuardianOptionProcessor(networkId string) *GuardianOption {
 				g.gatewayRelayer,
 				networkId,
 				g.alternatePublisher,
+				delegatedGuardiansEnabled,
+				managerC,
 			).Run
 
 			return nil
@@ -687,6 +743,12 @@ func getStaticFeatureFlags(g *G, featureFlags []string) []string {
 
 	if g.alternatePublisher != nil {
 		featureFlags = append(featureFlags, g.alternatePublisher.GetFeatures())
+	}
+
+	if g.managerService != nil {
+		if flag := g.managerService.GetFeatureString(); flag != "" {
+			featureFlags = append(featureFlags, flag)
+		}
 	}
 
 	return featureFlags
